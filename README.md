@@ -1,4 +1,4 @@
-# Heavy Mining (NeoForge 1.21.1)
+# Mining plus (NeoForge 1.21.1)
 
 A client-side mod that turns the flat vanilla arm-wave into a weighted pickaxe swing:
 
