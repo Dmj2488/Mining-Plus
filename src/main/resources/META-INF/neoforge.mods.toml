@@ -1,0 +1,26 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="MIT"
+
+[[mods]]
+modId="heavymining"
+version="1.0.0"
+displayName="Heavy Mining"
+description='''
+Weighted, physical pickaxe swings: wind-up, strike, impact and recoil,
+timed so the final hit lands as the block breaks.
+'''
+
+[[dependencies.heavymining]]
+modId="neoforge"
+type="required"
+versionRange="[21.1,)"
+ordering="NONE"
+side="CLIENT"
+
+[[dependencies.heavymining]]
+modId="minecraft"
+type="required"
+versionRange="[1.21.1,1.22)"
+ordering="NONE"
+side="CLIENT"
