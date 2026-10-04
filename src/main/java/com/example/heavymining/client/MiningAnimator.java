@@ -3,6 +3,7 @@ package com.example.heavymining.client;
 import com.example.heavymining.HeavyMining;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.math.Axis;
+import net.minecraft.Util;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.model.PlayerModel;
@@ -25,7 +26,9 @@ import net.minecraft.tags.ItemTags;
 import net.minecraft.util.Mth;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.HumanoidArm;
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.player.PlayerModelPart;
 import net.minecraft.world.item.ItemDisplayContext;
@@ -41,9 +44,11 @@ import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.client.event.RenderHandEvent;
 import net.neoforged.neoforge.client.event.RenderLevelStageEvent;
+import net.neoforged.neoforge.client.event.RenderPlayerEvent;
 import net.neoforged.neoforge.client.event.ViewportEvent;
 import net.neoforged.neoforge.client.event.sound.PlaySoundEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import org.joml.Matrix3f;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
@@ -85,7 +90,24 @@ public final class MiningAnimator {
     private static final float SWAY_MAX_DEGREES = 25f;
     /** Walking bob and idle breathing. 0 = off, 1 = normal. */
     private static final float WALK_BOB = 1f;
-    private static final float BREATHING = 1f;
+
+    // --- Idle hold (matched to your reference clip) ---
+    /** Hand position while just holding the pickaxe: out to the right, below eye level. */
+    private static final Vector3f HOLD_GRIP = new Vector3f(0.39f, -0.22f, -0.50f);
+    /** Handle direction: up, out to the right, and leaning away from you. */
+    private static final Vector3f HOLD_HANDLE = new Vector3f(0.47f, 0.43f, -0.76f);
+    /** Which way the pick's point faces: in toward the middle of the screen. */
+    private static final Vector3f HOLD_TIP = new Vector3f(-0.70f, -0.10f, -0.70f);
+    /** Slow breathing loop. Keeps going in the pause menu, like the clip. */
+    private static final float BREATH_PERIOD_SECONDS = 7f;
+    private static final float BREATH_MOVE = 0.008f;   // blocks
+    private static final float BREATH_TILT = 0.7f;     // degrees
+
+    // --- Body ---
+    /** Show your torso, legs and feet when you look down. */
+    private static final boolean SHOW_BODY = true;
+    /** How far the body sits behind your eyes (blocks), so you look down past your chest at your feet. */
+    private static final float BODY_BACK_OFFSET = 0.25f;
 
     // --- Arm ---
     private static final boolean SHOW_ARM = true;
@@ -105,8 +127,7 @@ public final class MiningAnimator {
     private static final float RAISED_PITCH = 100f;
     private static final float COCK_PITCH = 108f;
     private static final float FOLLOW_PITCH = -6f;
-    private static final float REST_PITCH = 20f;
-
+    /** Where the swing starts from and lunges out of (separate from the idle hold). */
     private static final Vector3f REST_GRIP = new Vector3f(0.30f, -0.36f, -0.40f);
     private static final Vector3f RAISED_GRIP = new Vector3f(0.40f, -0.14f, -0.22f);
     private static final Vector3f AIR_SWING_REACH = new Vector3f(0f, -0.02f, -0.18f);
@@ -153,6 +174,8 @@ public final class MiningAnimator {
     private static ItemStack lastHandStack = ItemStack.EMPTY;
     private static float lastEquip;
     private static boolean rigDrawnThisFrame;
+    private static boolean drawingFirstPersonBody;
+    private static boolean bodyHideMainArm;
 
     private static final Quaternionf aimQ = new Quaternionf();
     private static boolean aimInit;
@@ -324,12 +347,19 @@ public final class MiningAnimator {
         LocalPlayer player = mc.player;
         rigDrawnThisFrame = false;
         if (player == null || mc.level == null || player.isSpectator()
-                || mc.options.hideGui || !mc.options.getCameraType().isFirstPerson()
-                || !lastHandStack.is(ItemTags.PICKAXES)) {
+                || !mc.options.getCameraType().isFirstPerson() || mc.getCameraEntity() != player) {
             return;
         }
-
         float pt = mc.getTimer().getGameTimeDeltaPartialTick(false);
+        boolean drawRig = !mc.options.hideGui && lastHandStack.is(ItemTags.PICKAXES);
+
+        if (SHOW_BODY && !player.isInvisible()) {
+            MultiBufferSource.BufferSource bodyBuffers = mc.renderBuffers().bufferSource();
+            renderBody(mc, player, event.getCamera(), pt, bodyBuffers, drawRig && SHOW_ARM);
+            bodyBuffers.endBatch();
+        }
+        if (!drawRig) return;
+
         long now = System.nanoTime();
         float dt = lastFrameNanos == 0 ? 0.016f : Math.min(0.1f, (now - lastFrameNanos) / 1e9f);
         lastFrameNanos = now;
@@ -337,18 +367,17 @@ public final class MiningAnimator {
         Camera cam = event.getCamera();
         Quaternionf camRot = new Quaternionf(cam.rotation());
         float side = player.getMainArm() == HumanoidArm.RIGHT ? 1f : -1f;
-        float time = player.tickCount + pt;
 
         // --- blend weight: 0 = resting in hand, 1 = full swing ---
         float bt = (blendTicks + pt) / (blendingIn ? BLEND_IN_TICKS : BLEND_OUT_TICKS);
         float w = Mth.lerp(smooth(bt), blendFrom, blendingIn ? 1f : 0f);
         lastW = w;
 
-        // --- idle pose (with equip animation and breathing) ---
+        // --- idle hold pose (with equip animation and real-time breathing) ---
+        float breath = Mth.sin((Util.getMillis() / 1000f) * Mth.TWO_PI / BREATH_PERIOD_SECONDS);
         Vector3f restGrip = new Vector3f(REST_GRIP.x * side, REST_GRIP.y, REST_GRIP.z);
-        restGrip.y += -lastEquip * 0.6f + Mth.sin(time * 0.08f) * 0.006f * BREATHING;
-        float restPitch = REST_PITCH + Mth.sin(time * 0.06f) * 0.8f * BREATHING;
-        Pose idle = new Pose(restGrip, restPitch);
+        Vector3f holdGrip = new Vector3f(HOLD_GRIP.x * side, HOLD_GRIP.y - lastEquip * 0.6f - breath * BREATH_MOVE, HOLD_GRIP.z);
+        Pose idle = new Pose(holdGrip, breath * BREATH_TILT);
 
         // --- where the swing lands ---
         Vector3f raisedGrip = new Vector3f(RAISED_GRIP.x * side, RAISED_GRIP.y, RAISED_GRIP.z);
@@ -390,7 +419,7 @@ public final class MiningAnimator {
         pose = new Pose(new Vector3f(pose.grip).add(0f, 0f, s * RECOIL_KICK), pose.pitch + s * RECOIL_PITCH);
 
         // --- aim (smoothed, frame-rate independent) ---
-        Quaternionf restQ = aimQuat(REST_AIM, side);
+        Quaternionf restQ = holdQuat(side);
         Quaternionf goal = new Quaternionf(restQ).slerp(aimQuat(aimDir, side), w);
         if (!aimInit) {
             aimQ.set(goal);
@@ -446,6 +475,67 @@ public final class MiningAnimator {
         rigDrawnThisFrame = true;
     }
 
+    /**
+     * Draws your body with the normal player renderer, so armor, held items, elytra and cape all
+     * show up. The head (and your helmet) are skipped so they can't block your view, and the
+     * pickaxe arm is skipped while the mining rig is drawing it.
+     */
+    private static void renderBody(Minecraft mc, LocalPlayer player, Camera cam, float pt,
+                                   MultiBufferSource buffers, boolean hideMainArm) {
+        net.minecraft.world.entity.Pose pose = player.getPose();
+        if (pose != net.minecraft.world.entity.Pose.STANDING && pose != net.minecraft.world.entity.Pose.CROUCHING) {
+            return; // swimming, gliding, sleeping, etc. look wrong from inside the body
+        }
+        EntityRenderer<? super LocalPlayer> r = mc.getEntityRenderDispatcher().getRenderer(player);
+        if (!(r instanceof PlayerRenderer pr)) return;
+
+        Vec3 pos = player.getPosition(pt);
+        Vec3 cp = cam.getPosition();
+        float bodyYaw = Mth.rotLerp(pt, player.yBodyRotO, player.yBodyRot);
+        float yawRad = bodyYaw * Mth.DEG_TO_RAD;
+
+        PoseStack ps = new PoseStack();
+        ps.translate(pos.x - cp.x + Mth.sin(yawRad) * BODY_BACK_OFFSET,
+                     pos.y - cp.y + (player.isCrouching() ? -0.125f : 0f),
+                     pos.z - cp.z - Mth.cos(yawRad) * BODY_BACK_OFFSET);
+        int light = mc.getEntityRenderDispatcher().getPackedLightCoords(player, pt);
+
+        // For this one draw only: no helmet (it would cover the camera) and, if the rig is
+        // showing the pickaxe, no second pickaxe in the body's hand. Restored right after.
+        Inventory inv = player.getInventory();
+        int headSlot = EquipmentSlot.HEAD.getIndex();
+        ItemStack savedHelmet = inv.armor.get(headSlot);
+        int sel = inv.selected;
+        boolean swapMain = hideMainArm && Inventory.isHotbarSlot(sel);
+        ItemStack savedMain = swapMain ? inv.items.get(sel) : ItemStack.EMPTY;
+
+        bodyHideMainArm = hideMainArm;
+        drawingFirstPersonBody = true;
+        try {
+            inv.armor.set(headSlot, ItemStack.EMPTY);
+            if (swapMain) inv.items.set(sel, ItemStack.EMPTY);
+            pr.render(player, bodyYaw, pt, ps, buffers, light);
+        } finally {
+            inv.armor.set(headSlot, savedHelmet);
+            if (swapMain) inv.items.set(sel, savedMain);
+            drawingFirstPersonBody = false;
+        }
+    }
+
+    /** Runs inside the player renderer, after it sets up part visibility: hide head and pickaxe arm. */
+    @SubscribeEvent
+    public static void onRenderPlayerPre(RenderPlayerEvent.Pre event) {
+        if (!drawingFirstPersonBody) return;
+        PlayerModel<AbstractClientPlayer> model = event.getRenderer().getModel();
+        model.head.visible = false;
+        model.hat.visible = false;
+        if (bodyHideMainArm) {
+            boolean right = event.getEntity().getMainArm() == HumanoidArm.RIGHT;
+            (right ? model.rightArm : model.leftArm).visible = false;
+            (right ? model.rightSleeve : model.leftSleeve).visible = false;
+        }
+    }
+
     private static void renderArm(Minecraft mc, LocalPlayer player, PoseStack ps, MultiBufferSource buffers,
                                   int light, Vector3f shoulder, Vector3f hand, float side) {
         EntityRenderer<? super LocalPlayer> r = mc.getEntityRenderDispatcher().getRenderer(player);
@@ -488,6 +578,17 @@ public final class MiningAnimator {
             sleeve.loadPose(sleevePose);
             sleeve.visible = sleeveVisible;
         }
+    }
+
+    /** Orientation for the idle hold: handle along HOLD_HANDLE, point toward HOLD_TIP. */
+    private static Quaternionf holdQuat(float side) {
+        Vector3f y = new Vector3f(HOLD_HANDLE.x * side, HOLD_HANDLE.y, HOLD_HANDLE.z).normalize();
+        Vector3f f = new Vector3f(HOLD_TIP.x * side, HOLD_TIP.y, HOLD_TIP.z);
+        f.sub(new Vector3f(y).mul(f.dot(y))).normalize();   // make the point direction square to the handle
+        Vector3f z = new Vector3f(f).negate();              // sprite's local -Z is the point direction
+        Vector3f x = new Vector3f(y).cross(z).normalize();
+        Matrix3f m = new Matrix3f(x.x, x.y, x.z, y.x, y.y, y.z, z.x, z.y, z.z);
+        return new Quaternionf().setFromNormalized(m);
     }
 
     private static Quaternionf aimQuat(Vector3f dir, float side) {
